@@ -1,0 +1,12 @@
+requests
+aiohttp
+aiohttp_retry
+rapidfuzz
+tenacity
+asyncpg
+selectolax
+python-json-logger
+prometheus_client
+pytz
+python-dateutil
+python-dotenv 

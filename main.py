@@ -351,8 +351,22 @@ def parse_upcoming_datetime(date_text, time_text, timestamp=None):
 
 
 def parse_time_with_timezone(status):
-    if not status or status.strip() in ["Upcoming", "Match abandoned due to rain (No toss)", "Match abandoned without toss"] or \
+    if not status:
+        return datetime.now(pytz.UTC)
+        
+    # Skip parsing for known match statuses and cricket scores
+    if status.strip() in ["Upcoming", "Match abandoned due to rain (No toss)", "Match abandoned without toss"] or \
        any(kwd in status.lower() for kwd in ["won by", "lost by", "drawn", "no result", "tied", "stumps", "overs", "day", "session", "tea", "lunch"]):
+        return datetime.now(pytz.UTC)
+        
+    # Check if this is an IPL or cricket score format (team runs-wickets pattern)
+    if re.search(r'[A-Z]{2,4}\d+[-/]\d+\s*\([^)]*\)', status):
+        logger.debug({"message": "Cricket score format detected, skipping time parsing", "status": status})
+        return datetime.now(pytz.UTC)
+    
+    # Check for "need X runs in Y balls" pattern
+    if re.search(r'need \d+ runs in \d+ balls', status, re.IGNORECASE):
+        logger.debug({"message": "Run chase format detected, skipping time parsing", "status": status})
         return datetime.now(pytz.UTC)
 
     try:

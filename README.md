@@ -16,6 +16,7 @@ Real-time cricket score scraper aur API jo automatically Cricbuzz se live matche
 - **Flask API Endpoints**: Ready-to-use API endpoints jo match data provide karte hain
 - **Render URL Status Check**: Auto-detect feature jo Render deployment ki status check karta hai
 - **Single Port Operation**: Sabhi services (API, metrics, health) ek hi port pe run hoti hain
+- **Auto-Ping System**: Random intervals (1-2.5 minutes) par Render URL ko automatically ping karta hai, real user traffic simulate karke service ko always active rakhne ke liye
 
 
 ## Setup

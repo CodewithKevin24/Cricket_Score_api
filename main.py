@@ -882,9 +882,17 @@ async def main():
     error_count = 0
     max_consecutive_errors = 5
     
+    # For tracking the last time we pinged the Render URL
+    last_render_ping_time = 0
+    # Initially calculate a random interval
+    render_ping_interval = random.uniform(60, 150)  # Random between 1 min and 2.5 min
+    
     try:
         while True:
             try:
+                # Current time for timing operations
+                current_time = time.time()
+                
                 # Check if we have live matches in the database and adjust checking frequency
                 async with pool.acquire() as conn:
                     live_match_count = await conn.fetchval(
@@ -892,6 +900,38 @@ async def main():
                 
                 # If we have live matches, check more frequently
                 current_delay = max(15, base_delay - (live_match_count * 2))
+                
+                # Ping the Render URL to keep it alive (with random interval)
+                render_url = os.getenv('RENDER_URL')
+                if render_url and (current_time - last_render_ping_time) > render_ping_interval:
+                    logger.info({"message": f"Pinging Render URL to keep service alive: {render_url}", "interval": f"{render_ping_interval:.1f}s"})
+                    try:
+                        # Use real browser headers to look like a real user
+                        headers = {
+                            "User-Agent": random.choice(USER_AGENTS),
+                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                            "Accept-Language": random.choice(LANGUAGES) + ";q=0.8,en-US;q=0.5,en;q=0.3",
+                            "Cache-Control": "no-cache",
+                            "Pragma": "no-cache"
+                        }
+                        
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(render_url, timeout=10, headers=headers) as response:
+                                if response.status == 200:
+                                    logger.info({"message": f"Successfully pinged Render URL: {render_url}"})
+                                else:
+                                    logger.warning({"message": f"Render URL returned status {response.status}"})
+                        
+                        # Update the last ping time
+                        last_render_ping_time = current_time
+                        
+                        # Calculate a new random interval for next ping
+                        render_ping_interval = random.uniform(60, 150)
+                        logger.info({"message": f"Next Render ping scheduled in {render_ping_interval:.1f} seconds"})
+                    except Exception as ping_error:
+                        logger.error({"message": "Failed to ping Render URL", "error": str(ping_error)})
+                        # Still calculate a new interval for retry
+                        render_ping_interval = random.uniform(60, 150)
                 
                 last_etag = await scraping_task(pool, last_etag)
                 if last_etag:

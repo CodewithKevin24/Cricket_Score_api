@@ -72,10 +72,18 @@ console_handler.setFormatter(
                              datefmt='%Y-%m-%d %H:%M:%S'))
 logger.addHandler(console_handler)
 
-# Create Flask app
+# Verify Flask async support
+try:
+    from flask.app import AsyncExpectation
+    logger.info({"message": "Flask async support is available"})
+except ImportError:
+    logger.critical({"message": "Flask async support NOT available! Async routes will fail."})
+
+# Create Flask app with proper async support
 app = Flask(__name__)
 app.config['FLASK_APP'] = __name__
 app.config['FLASK_ENV'] = 'production'
+app.json.sort_keys = False  # For cleaner JSON responses
 
 # ----------------- Flask Routes -------------------
 @app.route('/')

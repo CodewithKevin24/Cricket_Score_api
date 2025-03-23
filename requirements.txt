@@ -9,4 +9,6 @@ python-json-logger
 prometheus_client
 pytz
 python-dateutil
-python-dotenv 
+python-dotenv
+flask
+hypercorn 

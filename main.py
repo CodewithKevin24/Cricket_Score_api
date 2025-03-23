@@ -13,7 +13,7 @@ import asyncpg
 from datetime import datetime, timezone, timedelta, time as dt_time
 from selectolax.parser import HTMLParser
 from pythonjsonlogger import jsonlogger
-from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import Counter, start_http_server
 import signal
 import sys
 import socket
@@ -23,17 +23,11 @@ import gc
 from dateutil import parser as date_parser
 import re
 from dotenv import load_dotenv
-from flask import Flask, request, jsonify, Response
-from concurrent.futures import ThreadPoolExecutor
 
 # Load environment variables from .env file
 load_dotenv()
 
-# ----------------- Configuration -------------------
-# Single port configuration for all services
-PORT = int(os.getenv("PORT", 5000))        # For all services (Flask API, Metrics, Health)
-
-# ----------------- Other Configuration -------------------
+# ----------------- Setup -------------------
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_USER = os.getenv("DB_USER") or sys.exit("Error: DB_USER not set")
 DB_PASS = os.getenv("DB_PASS") or sys.exit("Error: DB_PASS not set")
@@ -48,12 +42,15 @@ CRICBUZZ_URLS = {
 COMPLETED_THRESHOLD = int(os.getenv("COMPLETED_THRESHOLD", 85))
 LIVE_THRESHOLD = int(os.getenv("LIVE_THRESHOLD", 75))
 UPCOMING_THRESHOLD = int(os.getenv("UPCOMING_THRESHOLD", 70))
+PROMETHEUS_PORT = int(os.getenv("PROMETHEUS_PORT", 8000))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", 5))
 RETRY_DELAY = int(os.getenv("RETRY_DELAY", 2))
 MAX_TIMEOUT = int(os.getenv("MAX_TIMEOUT", 30))
-RENDER_URL = os.getenv("RENDER_URL")
+CHECK_PORT = os.getenv("CHECK_PORT", "true").lower() in ["true", "1", "yes"]
+# Render URL and keep-alive settings
+RENDER_URL = os.getenv("RENDER_URL", "")  # Your app's URL on Render
+KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_INTERVAL", 15 * 60))  # Default: ping every 15 minutes
 
-# ----------------- Logging Setup -------------------
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
 
@@ -72,101 +69,6 @@ console_handler.setFormatter(
                              datefmt='%Y-%m-%d %H:%M:%S'))
 logger.addHandler(console_handler)
 
-# Create Flask app
-app = Flask(__name__)
-app.config['FLASK_APP'] = __name__
-app.config['FLASK_ENV'] = 'production'
-
-# ----------------- Flask Routes -------------------
-@app.route('/')
-async def home():
-    render_url = os.getenv('RENDER_URL')  # Render link
-    if not render_url:
-        return "RENDER_URL not set! Please add it to your .env file.", 500
-
-    logger.info(f"Checking if {render_url} is live...")
-
-    # Add timeout for render URL checks to avoid infinite loops
-    max_attempts = 10
-    attempts = 0
-    
-    # Non-blocking check with a maximum number of attempts
-    async with aiohttp.ClientSession() as session:
-        while attempts < max_attempts:
-            try:
-                async with session.get(render_url, timeout=5) as response:  # 5 sec timeout
-                    if response.status == 200:
-                        logger.info(f"{render_url} is now live!")
-                        return f"Render Link {render_url} is Live!"
-            except Exception:
-                logger.warning(f"{render_url} is not live yet, retrying... ({attempts+1}/{max_attempts})")
-            
-            attempts += 1
-            await asyncio.sleep(3)  # Retry every 3 seconds
-    
-    # If we reach here, the URL wasn't live after max_attempts
-    return f"Render URL {render_url} could not be reached after {max_attempts} attempts. It might not be live yet.", 503
-
-@app.route('/check-render')
-async def check_render():
-    """
-    Route for checking render URL status without waiting - immediate response.
-    """
-    render_url = os.getenv('RENDER_URL')
-    if not render_url:
-        return jsonify({"status": "error", "message": "RENDER_URL not set"}), 500
-    
-    try:
-        # Use aiohttp for non-blocking HTTP requests instead of requests
-        async with aiohttp.ClientSession() as session:
-            async with session.get(render_url, timeout=5) as response:
-                return jsonify({
-                    "status": "success", 
-                    "is_live": response.status == 200,
-                    "status_code": response.status
-                })
-    except Exception as e:
-        return jsonify({
-            "status": "error", 
-            "is_live": False,
-            "message": str(e)
-        }), 503
-
-@app.route('/api/matches')
-async def get_matches():
-    match_type = request.args.get('type', 'all')
-    
-    if not hasattr(app, 'db_pool'):
-        return jsonify({"error": "Database not connected"}), 500
-    
-    try:
-        async with app.db_pool.acquire() as conn:
-            if match_type.lower() == 'all':
-                query = "SELECT * FROM matches ORDER BY last_updated DESC"
-                rows = await conn.fetch(query)
-            else:
-                query = "SELECT * FROM matches WHERE match_type = $1 ORDER BY last_updated DESC"
-                rows = await conn.fetch(query, match_type.capitalize())
-                
-            matches = [dict(row) for row in rows]
-            return jsonify({"matches": matches})
-    except Exception as e:
-        logger.error({"message": "API error", "error": str(e)})
-        return jsonify({"error": str(e)}), 500
-
-# Health check endpoint
-@app.route('/health')
-async def health():
-    """Simple health check endpoint"""
-    return jsonify({"status": "OK", "timestamp": datetime.now().isoformat()})
-
-# Prometheus metrics endpoint
-@app.route('/metrics')
-async def metrics():
-    """Prometheus metrics endpoint"""
-    return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
-
-# ----------------- User Agents -------------------
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15",
@@ -208,6 +110,7 @@ PARSING_ERRORS = Counter('parsing_errors', 'HTML parsing errors')
 CORRECT_CLASSIFICATIONS = Counter('correct_classifications',
                                   'Correct status classifications',
                                   ['match_type'])
+
 
 # ----------------- Database Connection -------------------
 @retry(stop=stop_after_attempt(5),
@@ -781,41 +684,86 @@ async def shutdown(pool):
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-# ----------------- Flask App Runner -------------------
-async def run_flask():
-    """Run the Flask API server."""
-    logger.info({"message": f"Starting unified server on port {PORT}"})
+# ----------------- Keep Alive Function -------------------
+async def render_keep_alive():
+    """
+    Function to periodically ping the service's own URL to prevent Render from shutting down.
+    This is necessary because Render free tier services go to sleep after inactivity.
+    """
+    if not RENDER_URL:
+        logger.warning({"message": "RENDER_URL not set, keep-alive pings disabled"})
+        return
+
+    logger.info({
+        "message": f"Setting up keep-alive pings every {KEEP_ALIVE_INTERVAL} seconds",
+        "url": RENDER_URL
+    })
     
-    try:
-        # First check if hypercorn is available
-        from hypercorn.asyncio import serve
-        from hypercorn.config import Config
-        
-        config = Config()
-        config.bind = [f"0.0.0.0:{PORT}"]
-        config.use_reloader = False
-        config.asyncio = True  # Enable asyncio support
-        
-        await serve(app, config)
-    except ImportError:
-        # Fall back to regular Flask if hypercorn is not available
-        logger.warning({"message": "Hypercorn not found, using Flask's built-in server (not production ready)"})
-        
-        # Have to run in a separate thread as Flask's development server is blocking
-        import threading
-        
-        def run_flask_dev_server():
-            # For development server, we need to use flask sync mode
-            # and ensure our routes are properly wrapped
-            app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
+    # Jitter to avoid all instances pinging at exactly the same time
+    jitter = random.randint(1, 60)
+    await asyncio.sleep(jitter)
+    
+    while True:
+        try:
+            # Randomize the endpoint to avoid cache issues
+            # Add a random query parameter to force a fresh request
+            random_param = f"nocache={int(time.time())}"
+            url = f"{RENDER_URL}?{random_param}"
             
-        threading.Thread(target=run_flask_dev_server, daemon=True).start()
-        
-        # Keep the async task alive
-        while True:
-            await asyncio.sleep(3600)  # Sleep for an hour at a time
-    except Exception as e:
-        logger.error({"message": "Flask server error", "error": str(e)})
+            headers = {
+                "User-Agent": random.choice(USER_AGENTS),
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0"
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                start_time = time.time()
+                async with session.get(url, headers=headers, timeout=30) as response:
+                    response_time = time.time() - start_time
+                    if response.status == 200:
+                        logger.info({
+                            "message": "Keep-alive ping successful",
+                            "url": RENDER_URL,
+                            "status": response.status,
+                            "response_time_ms": round(response_time * 1000)
+                        })
+                    else:
+                        logger.warning({
+                            "message": "Keep-alive ping returned non-200 status",
+                            "url": RENDER_URL,
+                            "status": response.status,
+                            "response_time_ms": round(response_time * 1000)
+                        })
+                        
+                    # Try again sooner if we get an error response
+                    if response.status >= 400:
+                        await asyncio.sleep(min(300, KEEP_ALIVE_INTERVAL // 3))
+                        continue
+                        
+        except asyncio.TimeoutError:
+            logger.error({
+                "message": "Keep-alive ping timed out",
+                "url": RENDER_URL
+            })
+            # Try again sooner on timeout
+            await asyncio.sleep(min(180, KEEP_ALIVE_INTERVAL // 4))
+            continue
+            
+        except Exception as e:
+            logger.error({
+                "message": "Keep-alive ping failed",
+                "url": RENDER_URL,
+                "error": str(e)
+            })
+            # Try again sooner on error
+            await asyncio.sleep(min(240, KEEP_ALIVE_INTERVAL // 3))
+            continue
+            
+        # Wait for the next ping interval - add small random variation
+        variation = random.uniform(0.8, 1.2)  # 20% variation
+        adjusted_interval = int(KEEP_ALIVE_INTERVAL * variation)
+        await asyncio.sleep(adjusted_interval)
 
 
 async def main():
@@ -828,14 +776,47 @@ async def main():
         logger.info({"message": "Log file cleared at startup"})
     except Exception as e:
         logger.error({"message": "Failed to clear log file", "error": str(e)})
+
+    def is_port_free(port):
+        if not CHECK_PORT:
+            return True
+            
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("0.0.0.0", port))
+                return True
+            except OSError:
+                return False
+
+    # Try to find an available port if the default one is taken
+    current_port = PROMETHEUS_PORT
+    if CHECK_PORT and not is_port_free(current_port):
+        for port in range(current_port + 1, current_port + 10):
+            if is_port_free(port):
+                logger.info({
+                    "message": f"Port {current_port} in use, using port {port} instead"
+                })
+                current_port = port
+                break
+        else:
+            logger.error({"message": f"No available ports found in range {current_port}-{current_port+10}"})
+            sys.exit(1)
+
+    try:
+        start_http_server(current_port)
+        logger.info({
+            "message": f"Prometheus metrics server started on port {current_port}"
+        })
+    except Exception as e:
+        logger.error({
+            "message": "Failed to start metrics server",
+            "error": str(e)
+        })
+        # Continue without metrics if it fails
     
-    # Setup database connection
     pool = None
     try:
         pool = await init_db_pool()
-        # Store pool in the Flask app context
-        app.db_pool = pool
-        
         # Register the pool with signal handlers if function exists
         if 'set_db_pool' in globals():
             set_db_pool(pool)
@@ -853,27 +834,33 @@ async def main():
         })
         sys.exit(1)
 
-    # Start Flask server in a separate task
-    flask_task = asyncio.create_task(run_flask())
-    logger.info({"message": f"Unified server task started on port {PORT}", "pid": os.getpid()})
+    # Start the keep-alive pinger as a background task
+    if RENDER_URL:
+        keep_alive_task = asyncio.create_task(render_keep_alive())
+        logger.info({
+            "message": "Started Render keep-alive service",
+            "url": RENDER_URL,
+            "interval_seconds": KEEP_ALIVE_INTERVAL
+        })
+        print(f"Render keep-alive service chalu ho gaya hai. Har {KEEP_ALIVE_INTERVAL//60} minute mein ping karega.")
 
-    # Start the main cricket data scraper
     last_etag = await load_etag()
     logger.info({
-        "message": "Cricket scraper started",
+        "message": "Scraper started",
         "pid": os.getpid(),
         "timestamp": time.time()
     })
     print("Scraper chalu hai. Logs dekho 'cricket_scraper.log' mein.")
     
-    # Summary of active servers
-    print(f"\nUnified server running on port {PORT}:")
-    print(f"- API endpoints: http://localhost:{PORT}/api/matches")
-    print(f"- Health check: http://localhost:{PORT}/health")
-    print(f"- Prometheus metrics: http://localhost:{PORT}/metrics")
-    print(f"- Render URL check: http://localhost:{PORT}/")
-    print("\n")
-    
+    # Health check endpoint in a separate task
+    if CHECK_PORT and current_port != PROMETHEUS_PORT:
+        try:
+            health_port = current_port + 100
+            if is_port_free(health_port):
+                asyncio.create_task(setup_health_endpoint(health_port))
+        except Exception as e:
+            logger.error({"message": "Failed to setup health endpoint", "error": str(e)})
+
     # Reduced base delay for more frequent updates
     base_delay = 30  # Changed from 60 to 30 seconds
     
@@ -882,122 +869,94 @@ async def main():
     error_count = 0
     max_consecutive_errors = 5
     
-    # For tracking the last time we pinged the Render URL
-    last_render_ping_time = 0
-    # Random ping interval between 1 minute and 2.5 minutes (60-150 seconds)
-    min_ping_interval = 60  # 1 minute
-    max_ping_interval = 150  # 2.5 minutes
+    while True:
+        try:
+            # Check if we have live matches in the database and adjust checking frequency
+            async with pool.acquire() as conn:
+                live_match_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM matches WHERE match_type IN ('Live', 'Test')")
+            
+            # If we have live matches, check more frequently
+            current_delay = max(15, base_delay - (live_match_count * 2))
+            
+            last_etag = await scraping_task(pool, last_etag)
+            if last_etag:
+                await save_etag(last_etag)
+            
+            # Reset error count on successful run
+            error_count = 0
+            
+            # Memory management
+            gc.collect()
+            
+            # Use a shorter delay with small random variation
+            delay = random.uniform(current_delay, current_delay + 15)
+            logger.info({
+                "message": "Sleeping", 
+                "delay": delay,
+                "live_matches": live_match_count
+            })
+            await asyncio.sleep(delay)
+        except asyncpg.exceptions.PostgresConnectionError as e:
+            error_count += 1
+            logger.error({
+                "message": "Database connection lost",
+                "error": str(e).replace(DB_PASS, "********"),
+                "error_count": error_count
+            })
+            
+            # Try to reconnect to the database
+            if error_count >= max_consecutive_errors:
+                logger.critical({
+                    "message": f"Too many consecutive errors ({error_count}), attempting to reinitialize pool"
+                })
+                try:
+                    if pool:
+                        await pool.close()
+                    pool = await init_db_pool()
+                    if 'set_db_pool' in globals():
+                        set_db_pool(pool)
+                    error_count = 0
+                except Exception as reconnect_error:
+                    logger.critical({
+                        "message": "Failed to reinitialize pool",
+                        "error": str(reconnect_error).replace(DB_PASS, "********")
+                    })
+            
+            await asyncio.sleep(min(30 * error_count, 300))  # Backoff with max 5 minutes
+        except Exception as e:
+            error_count += 1
+            logger.error({
+                "message": "Scraping task failed",
+                "error": str(e),
+                "error_count": error_count
+            })
+            if error_count >= max_consecutive_errors:
+                logger.critical({
+                    "message": f"Too many consecutive errors ({error_count}), restarting main loop"
+                })
+                error_count = 0
+            await asyncio.sleep(min(30 * error_count, 300))  # Backoff with max 5 minutes
+
+# Simple health check HTTP server
+async def setup_health_endpoint(port):
+    from aiohttp import web
+    
+    async def health_handler(request):
+        return web.Response(text="OK", status=200)
+    
+    app = web.Application()
+    app.router.add_get('/health', health_handler)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
     
     try:
-        while True:
-            try:
-                # Current time for timing operations
-                current_time = time.time()
-                
-                # Generate a random interval for this cycle
-                render_ping_interval = random.uniform(min_ping_interval, max_ping_interval)
-                
-                # Check if we have live matches in the database and adjust checking frequency
-                async with pool.acquire() as conn:
-                    live_match_count = await conn.fetchval(
-                        "SELECT COUNT(*) FROM matches WHERE match_type IN ('Live', 'Test')")
-                
-                # If we have live matches, check more frequently
-                current_delay = max(15, base_delay - (live_match_count * 2))
-                
-                # Ping the Render URL to keep it alive (random interval between 1-2.5 minutes)
-                render_url = os.getenv('RENDER_URL')
-                if render_url and (current_time - last_render_ping_time) > render_ping_interval:
-                    logger.info({"message": f"Pinging Render URL to keep service alive: {render_url}", "interval": round(render_ping_interval, 1)})
-                    try:
-                        # Use random User-Agent to mimic different browsers
-                        headers = {"User-Agent": random.choice(USER_AGENTS)}
-                        
-                        # Randomly choose between different endpoints to look more like real user traffic
-                        endpoints = ["", "/health", "/check-render"]
-                        chosen_endpoint = random.choice(endpoints)
-                        ping_url = f"{render_url}{chosen_endpoint}"
-                        
-                        async with aiohttp.ClientSession() as session:
-                            async with session.get(ping_url, headers=headers, timeout=10) as response:
-                                if response.status == 200:
-                                    logger.info({"message": f"Successfully pinged Render URL: {ping_url}"})
-                                else:
-                                    logger.warning({"message": f"Render URL returned status {response.status}"})
-                        last_render_ping_time = current_time
-                    except Exception as ping_error:
-                        logger.error({"message": "Failed to ping Render URL", "error": str(ping_error)})
-                
-                last_etag = await scraping_task(pool, last_etag)
-                if last_etag:
-                    await save_etag(last_etag)
-                
-                # Reset error count on successful run
-                error_count = 0
-                
-                # Memory management
-                gc.collect()
-                
-                # Use a shorter delay with small random variation
-                delay = random.uniform(current_delay, current_delay + 15)
-                logger.info({
-                    "message": "Sleeping", 
-                    "delay": delay,
-                    "live_matches": live_match_count
-                })
-                await asyncio.sleep(delay)
-            except asyncpg.exceptions.PostgresConnectionError as e:
-                error_count += 1
-                logger.error({
-                    "message": "Database connection lost",
-                    "error": str(e).replace(DB_PASS, "********"),
-                    "error_count": error_count
-                })
-                
-                # Try to reconnect to the database
-                if error_count >= max_consecutive_errors:
-                    logger.critical({
-                        "message": f"Too many consecutive errors ({error_count}), attempting to reinitialize pool"
-                    })
-                    try:
-                        if pool:
-                            await pool.close()
-                        pool = await init_db_pool()
-                        app.db_pool = pool  # Update Flask app's pool reference
-                        if 'set_db_pool' in globals():
-                            set_db_pool(pool)
-                        error_count = 0
-                    except Exception as reconnect_error:
-                        logger.critical({
-                            "message": "Failed to reinitialize pool",
-                            "error": str(reconnect_error).replace(DB_PASS, "********")
-                        })
-                
-                await asyncio.sleep(min(30 * error_count, 300))  # Backoff with max 5 minutes
-            except Exception as e:
-                error_count += 1
-                logger.error({
-                    "message": "Scraping task failed",
-                    "error": str(e),
-                    "error_count": error_count
-                })
-                if error_count >= max_consecutive_errors:
-                    logger.critical({
-                        "message": f"Too many consecutive errors ({error_count}), restarting main loop"
-                    })
-                    error_count = 0
-                await asyncio.sleep(min(30 * error_count, 300))  # Backoff with max 5 minutes
-    except asyncio.CancelledError:
-        logger.info({"message": "Main task cancelled"})
+        await site.start()
+        logger.info({"message": f"Health check endpoint started on port {port}"})
     except Exception as e:
-        logger.error({"message": "Main task exception", "error": str(e)})
-    finally:
-        # Cancel background task
-        flask_task.cancel()
-        try:
-            await flask_task
-        except asyncio.CancelledError:
-            pass
+        logger.error({"message": "Failed to start health endpoint", "error": str(e)})
 
 
 if __name__ == "__main__":

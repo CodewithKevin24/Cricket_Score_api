@@ -16,7 +16,7 @@ Real-time cricket score scraper aur API jo automatically Cricbuzz se live matche
 - **Flask API Endpoints**: Ready-to-use API endpoints jo match data provide karte hain
 - **Render URL Status Check**: Auto-detect feature jo Render deployment ki status check karta hai
 - **Single Port Operation**: Sabhi services (API, metrics, health) ek hi port pe run hoti hain
-- **Auto-Ping System**: Random intervals (1-2.5 minutes) par Render URL ko automatically ping karta hai, real user traffic simulate karke service ko always active rakhne ke liye
+- **Auto-Ping System**: Random intervals (1-2.5 minutes) mein Render URL ko automatically ping karta hai taaki service kabhi sleep mode mein na jaye aur real user traffic jaisa effect ho
 
 
 ## Setup
@@ -57,26 +57,6 @@ pip install -r requirements.txt
 # Run the application
 python main.py
 ```
-
-### Deployment on Render
-
-Render par deploy karte samay in baaton ka dhyan rakhein:
-
-1. **Flask Async Support**: Flask async routes ke liye `flask[async]` package zaruri hai
-   - Render dashboard par environment variables mein `PYTHON_VERSION=3.9` ya usse latest set karein
-   - `requirements.txt` mein exact versions specify karna important hai
-
-2. **Deploy Settings**:
-   - Build Command: `pip install -U pip && pip install -r requirements.txt`
-   - Start Command: `python main.py`
-
-3. **Environment Variables**:
-   - `.env` file mein `RENDER_URL` ko actual deployment URL se replace karein
-   - Database credentials ko secure environment variables ke through set karein
-
-4. **Troubleshooting**:
-   - Agar async routes par error aaye toh Render dashboard se manual redeploy karein
-   - Logs mein check karein ki "Flask async support is available" message aaya hai
 
 ## API Endpoints
 

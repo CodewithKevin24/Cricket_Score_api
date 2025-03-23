@@ -13,7 +13,7 @@ import asyncpg
 from datetime import datetime, timezone, timedelta, time as dt_time
 from selectolax.parser import HTMLParser
 from pythonjsonlogger import jsonlogger
-from prometheus_client import Counter, start_http_server
+from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
 import signal
 import sys
 import socket
@@ -23,20 +23,15 @@ import gc
 from dateutil import parser as date_parser
 import re
 from dotenv import load_dotenv
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from concurrent.futures import ThreadPoolExecutor
 
 # Load environment variables from .env file
 load_dotenv()
 
-# ----------------- Ports Configuration -------------------
-# All ports used in the application are defined here
-FLASK_PORT = int(os.getenv("FLASK_PORT", 5000))        # For Flask API server
-PROMETHEUS_PORT = int(os.getenv("PROMETHEUS_PORT", 8000))  # For Prometheus metrics server
-HEALTH_PORT = int(os.getenv("HEALTH_PORT", 0))         # For health check endpoint (0 means auto calculate)
-if HEALTH_PORT == 0:
-    HEALTH_PORT = PROMETHEUS_PORT + 100                # Default to PROMETHEUS_PORT + 100 if not specified
-CHECK_PORT = os.getenv("CHECK_PORT", "true").lower() in ["true", "1", "yes"]  # Whether to check if ports are in use
+# ----------------- Configuration -------------------
+# Single port configuration for all services
+PORT = int(os.getenv("PORT", 5000))        # For all services (Flask API, Metrics, Health)
 
 # ----------------- Other Configuration -------------------
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -79,6 +74,8 @@ logger.addHandler(console_handler)
 
 # Create Flask app
 app = Flask(__name__)
+app.config['FLASK_APP'] = __name__
+app.config['FLASK_ENV'] = 'production'
 
 # ----------------- Flask Routes -------------------
 @app.route('/')
@@ -94,17 +91,18 @@ async def home():
     attempts = 0
     
     # Non-blocking check with a maximum number of attempts
-    while attempts < max_attempts:
-        try:
-            res = requests.get(render_url, timeout=5)  # 5 sec timeout
-            if res.status_code == 200:
-                logger.info(f"{render_url} is now live!")
-                return f"Render Link {render_url} is Live!"
-        except requests.RequestException:
-            logger.warning(f"{render_url} is not live yet, retrying... ({attempts+1}/{max_attempts})")
-        
-        attempts += 1
-        await asyncio.sleep(3)  # Retry every 3 seconds
+    async with aiohttp.ClientSession() as session:
+        while attempts < max_attempts:
+            try:
+                async with session.get(render_url, timeout=5) as response:  # 5 sec timeout
+                    if response.status == 200:
+                        logger.info(f"{render_url} is now live!")
+                        return f"Render Link {render_url} is Live!"
+            except Exception:
+                logger.warning(f"{render_url} is not live yet, retrying... ({attempts+1}/{max_attempts})")
+            
+            attempts += 1
+            await asyncio.sleep(3)  # Retry every 3 seconds
     
     # If we reach here, the URL wasn't live after max_attempts
     return f"Render URL {render_url} could not be reached after {max_attempts} attempts. It might not be live yet.", 503
@@ -119,13 +117,15 @@ async def check_render():
         return jsonify({"status": "error", "message": "RENDER_URL not set"}), 500
     
     try:
-        res = requests.get(render_url, timeout=5)
-        return jsonify({
-            "status": "success", 
-            "is_live": res.status_code == 200,
-            "status_code": res.status_code
-        })
-    except requests.RequestException as e:
+        # Use aiohttp for non-blocking HTTP requests instead of requests
+        async with aiohttp.ClientSession() as session:
+            async with session.get(render_url, timeout=5) as response:
+                return jsonify({
+                    "status": "success", 
+                    "is_live": response.status == 200,
+                    "status_code": response.status
+                })
+    except Exception as e:
         return jsonify({
             "status": "error", 
             "is_live": False,
@@ -153,6 +153,18 @@ async def get_matches():
     except Exception as e:
         logger.error({"message": "API error", "error": str(e)})
         return jsonify({"error": str(e)}), 500
+
+# Health check endpoint
+@app.route('/health')
+async def health():
+    """Simple health check endpoint"""
+    return jsonify({"status": "OK", "timestamp": datetime.now().isoformat()})
+
+# Prometheus metrics endpoint
+@app.route('/metrics')
+async def metrics():
+    """Prometheus metrics endpoint"""
+    return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
 
 # ----------------- User Agents -------------------
 USER_AGENTS = [
@@ -771,8 +783,8 @@ async def shutdown(pool):
 
 # ----------------- Flask App Runner -------------------
 async def run_flask():
-    """Run the Flask API server in a separate thread."""
-    logger.info({"message": f"Starting Flask API server on port {FLASK_PORT}"})
+    """Run the Flask API server."""
+    logger.info({"message": f"Starting unified server on port {PORT}"})
     
     try:
         # First check if hypercorn is available
@@ -780,8 +792,9 @@ async def run_flask():
         from hypercorn.config import Config
         
         config = Config()
-        config.bind = [f"0.0.0.0:{FLASK_PORT}"]
+        config.bind = [f"0.0.0.0:{PORT}"]
         config.use_reloader = False
+        config.asyncio = True  # Enable asyncio support
         
         await serve(app, config)
     except ImportError:
@@ -792,7 +805,9 @@ async def run_flask():
         import threading
         
         def run_flask_dev_server():
-            app.run(host='0.0.0.0', port=FLASK_PORT, debug=False, use_reloader=False)
+            # For development server, we need to use flask sync mode
+            # and ensure our routes are properly wrapped
+            app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
             
         threading.Thread(target=run_flask_dev_server, daemon=True).start()
         
@@ -801,30 +816,6 @@ async def run_flask():
             await asyncio.sleep(3600)  # Sleep for an hour at a time
     except Exception as e:
         logger.error({"message": "Flask server error", "error": str(e)})
-
-
-# Simple health check HTTP server that runs on a separate port
-async def setup_health_endpoint(port):
-    """Setup a simple HTTP server just for health checks."""
-    logger.info({"message": f"Starting health check endpoint on port {port}"})
-    
-    from aiohttp import web
-    
-    async def health_handler(request):
-        return web.Response(text="OK", status=200)
-    
-    app = web.Application()
-    app.router.add_get('/health', health_handler)
-    
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    
-    try:
-        await site.start()
-        logger.info({"message": f"Health check endpoint started on port {port}"})
-    except Exception as e:
-        logger.error({"message": "Failed to start health endpoint", "error": str(e)})
 
 
 async def main():
@@ -837,45 +828,6 @@ async def main():
         logger.info({"message": "Log file cleared at startup"})
     except Exception as e:
         logger.error({"message": "Failed to clear log file", "error": str(e)})
-
-    # Function to check if a port is available
-    def is_port_free(port):
-        if not CHECK_PORT:
-            return True
-            
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try:
-                s.bind(("0.0.0.0", port))
-                return True
-            except OSError:
-                return False
-
-    # Setup Prometheus metrics server
-    prometheus_port = PROMETHEUS_PORT
-    if CHECK_PORT and not is_port_free(prometheus_port):
-        for port in range(prometheus_port + 1, prometheus_port + 10):
-            if is_port_free(port):
-                logger.info({
-                    "message": f"Port {prometheus_port} in use, using port {port} for Prometheus instead"
-                })
-                prometheus_port = port
-                break
-        else:
-            logger.error({"message": f"No available ports found in range {prometheus_port}-{prometheus_port+10} for Prometheus"})
-            prometheus_port = None
-
-    if prometheus_port:
-        try:
-            start_http_server(prometheus_port)
-            logger.info({
-                "message": f"Prometheus metrics server started on port {prometheus_port}"
-            })
-        except Exception as e:
-            logger.error({
-                "message": "Failed to start Prometheus metrics server",
-                "error": str(e)
-            })
-            prometheus_port = None
     
     # Setup database connection
     pool = None
@@ -901,30 +853,9 @@ async def main():
         })
         sys.exit(1)
 
-    # Start Flask API server in a separate task
+    # Start Flask server in a separate task
     flask_task = asyncio.create_task(run_flask())
-    logger.info({"message": f"Flask API server task started on port {FLASK_PORT}", "pid": os.getpid()})
-
-    # Start health check endpoint in a separate task
-    health_port = HEALTH_PORT
-    if CHECK_PORT and not is_port_free(health_port):
-        for port in range(health_port + 1, health_port + 10):
-            if is_port_free(port):
-                logger.info({
-                    "message": f"Port {health_port} in use, using port {port} for health checks instead"
-                })
-                health_port = port
-                break
-        else:
-            logger.error({"message": f"No available ports found in range {health_port}-{health_port+10} for health checks"})
-            health_port = None
-    
-    if health_port:
-        try:
-            health_task = asyncio.create_task(setup_health_endpoint(health_port))
-            logger.info({"message": f"Health check endpoint task started on port {health_port}"})
-        except Exception as e:
-            logger.error({"message": "Failed to setup health endpoint", "error": str(e)})
+    logger.info({"message": f"Unified server task started on port {PORT}", "pid": os.getpid()})
 
     # Start the main cricket data scraper
     last_etag = await load_etag()
@@ -936,12 +867,11 @@ async def main():
     print("Scraper chalu hai. Logs dekho 'cricket_scraper.log' mein.")
     
     # Summary of active servers
-    print(f"\nServers running:")
-    print(f"1. Flask API server: http://localhost:{FLASK_PORT}")
-    if prometheus_port:
-        print(f"2. Prometheus metrics: http://localhost:{prometheus_port}")
-    if health_port:
-        print(f"3. Health check endpoint: http://localhost:{health_port}/health")
+    print(f"\nUnified server running on port {PORT}:")
+    print(f"- API endpoints: http://localhost:{PORT}/api/matches")
+    print(f"- Health check: http://localhost:{PORT}/health")
+    print(f"- Prometheus metrics: http://localhost:{PORT}/metrics")
+    print(f"- Render URL check: http://localhost:{PORT}/")
     print("\n")
     
     # Reduced base delay for more frequent updates
@@ -1027,20 +957,12 @@ async def main():
     except Exception as e:
         logger.error({"message": "Main task exception", "error": str(e)})
     finally:
-        # Cancel all background tasks
+        # Cancel background task
         flask_task.cancel()
         try:
             await flask_task
         except asyncio.CancelledError:
             pass
-            
-        # Also cancel health check task if it exists
-        if 'health_task' in locals():
-            health_task.cancel()
-            try:
-                await health_task
-            except asyncio.CancelledError:
-                pass
 
 
 if __name__ == "__main__":
